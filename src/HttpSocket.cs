@@ -226,40 +226,58 @@ namespace HttpSocket
 
                     while (true)
                     {
-                        if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> chunkSizeText, (byte)'\n') || !Utf8Parser.TryParse(chunkSizeText, out int chunkSize, out _, 'x'))
+
+                        // Do we need to continue reading a active chunk?
+                        if (httpResponse.LastChunkRemaining > 0)
                         {
-                            httpResponse.State = HttpResponseState.Error;
-                            return;
+                            var bytesToRead = Math.Min(httpResponse.LastChunkRemaining, sequenceReader.Remaining);
+
+                            httpResponse.LastChunkRemaining -= (int)bytesToRead;
+
+                            for (var i = 0; i < bytesToRead; i++)
+                            {
+                                if (!sequenceReader.TryRead(out _))
+                                {
+                                    httpResponse.State = HttpResponseState.Error;
+                                    return;
+                                }
+                            }
+
+                            // We need to read more data
+                            if (httpResponse.LastChunkRemaining > 0)
+                            {
+                                break;
+                            }
                         }
-
-                        httpResponse.ContentLength += chunkSize;
-
-                        // The last chunk is always of size 0
-                        if (chunkSize == 0)
+                        else
                         {
-                            // The Body should end with two NewLine
-                            if (!sequenceReader.TryReadTo(out _, NewLine))
+                            if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> chunkSizeText, (byte)'\n') || !Utf8Parser.TryParse(chunkSizeText, out int chunkSize, out _, 'x'))
                             {
                                 httpResponse.State = HttpResponseState.Error;
                                 return;
                             }
 
-                            examined = sequenceReader.Position;
-                            httpResponse.State = HttpResponseState.Completed;
+                            httpResponse.ContentLength += chunkSize;
+                            httpResponse.LastChunkRemaining = chunkSize;
 
-                            break;
-                        }
-
-                        for (var i = 0; i < chunkSize; i++)
-                        {
-                            if (!sequenceReader.TryRead(out _))
+                            // The last chunk is always of size 0
+                            if (chunkSize == 0)
                             {
-                                httpResponse.State = HttpResponseState.Error;
-                                return;
+                                // The Body should end with two NewLine
+                                if (!sequenceReader.TryReadTo(out _, NewLine))
+                                {
+                                    httpResponse.State = HttpResponseState.Error;
+                                    return;
+                                }
+
+                                examined = sequenceReader.Position;
+                                httpResponse.State = HttpResponseState.Completed;
+
+                                break;
                             }
                         }
 
-                        if (!sequenceReader.TryReadTo(out _, NewLine))
+                        if (httpResponse.LastChunkRemaining == 0 && !sequenceReader.TryReadTo(out _, NewLine))
                         {
                             httpResponse.State = HttpResponseState.Error;
                             return;
@@ -316,6 +334,7 @@ namespace HttpSocket
             public int StatusCode { get; set; }
             public int ContentLength { get; set; }
             public bool HasContentLengthHeader { get; set; }
+            public int LastChunkRemaining { get; set; }
         }
     }
 }
