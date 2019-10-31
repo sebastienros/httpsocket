@@ -44,7 +44,7 @@ namespace HttpSocket
 
                 try
                 {
-                    for (var k = 0; k < 10; k++)
+                    for (var k = 0; k < 100000; k++)
                     {
                         var httpResponse = new HttpResponse();
 
@@ -52,7 +52,7 @@ namespace HttpSocket
 
                         await ReadPipeAsync(pipe.Reader, httpResponse);
 
-                        Console.WriteLine($"Result: {httpResponse.State}, Status: {httpResponse.StatusCode}, Content-Length: {httpResponse.ContentLength}");
+                        Console.WriteLine($"Result: {httpResponse.State}, Status: {httpResponse.StatusCode}, Content-Length: {httpResponse.ContentLength}, Reads: {httpResponse.Reads}");
 
                         // Stop sending request if the communication faced a problem (socket error)
                         if (httpResponse.State != HttpResponseState.Completed)
@@ -108,6 +108,8 @@ namespace HttpSocket
             {
                 ReadResult result = await reader.ReadAsync();
                 var buffer = result.Buffer;
+
+                httpResponse.Reads++;
 
                 ParseHttpResponse(ref buffer, httpResponse, out var examined);
 
@@ -218,15 +220,12 @@ namespace HttpSocket
                         sequenceReader.Advance(bytesToRead);
 
                         examined = sequenceReader.Position;
-
-                        if (httpResponse.ContentLengthRemaining > 0)
-                        {
-                            // We need to read more data
-                            return;
-                        }
                     }
 
-                    httpResponse.State = HttpResponseState.Completed;
+                    if (httpResponse.ContentLengthRemaining == 0)
+                    {
+                        httpResponse.State = HttpResponseState.Completed;
+                    }
 
                     break;
 
@@ -243,20 +242,32 @@ namespace HttpSocket
 
                             sequenceReader.Advance(bytesToRead);
 
-                            examined = sequenceReader.Position;
-
                             if (httpResponse.LastChunkRemaining > 0)
                             {
+                                examined = sequenceReader.Position;
                                 // We need to read more data
-                                return;
+                                break;
                             }
+                            else if (!sequenceReader.TryReadTo(out _, NewLine))
+                            {
+                                httpResponse.State = HttpResponseState.Error;
+                                break;
+                            }
+
+                            examined = sequenceReader.Position;
                         }
                         else
                         {
-                            if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> chunkSizeText, (byte)'\n') || !Utf8Parser.TryParse(chunkSizeText, out int chunkSize, out _, 'x'))
+                            if (!sequenceReader.TryReadTo(out ReadOnlySequence<byte> chunkSizeText, NewLine))
+                            {
+                                // Don't have a full chunk yet
+                                break;
+                            }
+
+                            if (!TryParseChunkPrefix(chunkSizeText, out int chunkSize))
                             {
                                 httpResponse.State = HttpResponseState.Error;
-                                return;
+                                break;
                             }
 
                             httpResponse.ContentLength += chunkSize;
@@ -269,7 +280,7 @@ namespace HttpSocket
                                 if (!sequenceReader.TryReadTo(out _, NewLine))
                                 {
                                     httpResponse.State = HttpResponseState.Error;
-                                    return;
+                                    break;
                                 }
 
                                 examined = sequenceReader.Position;
@@ -277,12 +288,6 @@ namespace HttpSocket
 
                                 break;
                             }
-                        }
-
-                        if (httpResponse.LastChunkRemaining == 0 && !sequenceReader.TryReadTo(out _, NewLine))
-                        {
-                            httpResponse.State = HttpResponseState.Error;
-                            return;
                         }
                     }
 
@@ -293,7 +298,7 @@ namespace HttpSocket
             buffer = buffer.Slice(sequenceReader.Position);
         }
 
-        static void ParseHeader(in ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
+        private static void ParseHeader(in ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
         {
             var headerReader = new SequenceReader<byte>(headerLine);
 
@@ -317,30 +322,60 @@ namespace HttpSocket
                     return;
                 }
 
-                if (remaining.IsSingleSegment)
+                if (!TryParseContentLength(remaining, out int contentLength))
                 {
-                    if (!Utf8Parser.TryParse(remaining.FirstSpan.TrimStart((byte)' '), out int contentLength, out _))
-                    {
-                        httpResponse.State = HttpResponseState.Error;
-                        return;
-                    }
-
-                    httpResponse.ContentLength = contentLength;
-                }
-                else
-                {
-                    Span<byte> contentLengthText = stackalloc byte[128];
-                    remaining.CopyTo(contentLengthText);
-
-                    if (!Utf8Parser.TryParse(contentLengthText.TrimStart((byte)' '), out int contentLength, out _))
-                    {
-                        httpResponse.State = HttpResponseState.Error;
-                        return;
-                    }
+                    httpResponse.State = HttpResponseState.Error;
+                    return;
                 }
 
-                httpResponse.ContentLengthRemaining = httpResponse.ContentLength;
+                httpResponse.ContentLength = contentLength;
+                httpResponse.ContentLengthRemaining = contentLength;
             }
+        }
+
+        private static bool TryParseChunkPrefix(in ReadOnlySequence<byte> chunkSizeText, out int chunkSize)
+        {
+            if (chunkSizeText.IsSingleSegment)
+            {
+                if (!Utf8Parser.TryParse(chunkSizeText.FirstSpan, out chunkSize, out _, 'x'))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                Span<byte> chunkSizeTextSpan = stackalloc byte[128];
+                chunkSizeTextSpan.CopyTo(chunkSizeTextSpan);
+
+                if (!Utf8Parser.TryParse(chunkSizeTextSpan, out chunkSize, out _, 'x'))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static bool TryParseContentLength(in ReadOnlySequence<byte> remaining, out int contentLength)
+        {
+            if (remaining.IsSingleSegment)
+            {
+                if (!Utf8Parser.TryParse(remaining.FirstSpan.TrimStart((byte)' '), out contentLength, out _))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                Span<byte> contentLengthText = stackalloc byte[128];
+                remaining.CopyTo(contentLengthText);
+
+                if (!Utf8Parser.TryParse(contentLengthText.TrimStart((byte)' '), out contentLength, out _))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private enum HttpResponseState
@@ -361,6 +396,7 @@ namespace HttpSocket
             public long ContentLengthRemaining { get; set; }
             public bool HasContentLengthHeader { get; set; }
             public int LastChunkRemaining { get; set; }
+            public int Reads { get; set; }
         }
     }
 }
