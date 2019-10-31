@@ -226,7 +226,7 @@ namespace HttpSocket
 
                     while (true)
                     {
-                        if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> chunkSizeText, (byte)'\n') || !Utf8Parser.TryParse(chunkSizeText, out int chunkSize, out _))
+                        if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> chunkSizeText, (byte)'\n') || !Utf8Parser.TryParse(chunkSizeText, out int chunkSize, out _, 'x'))
                         {
                             httpResponse.State = HttpResponseState.Error;
                             return;
