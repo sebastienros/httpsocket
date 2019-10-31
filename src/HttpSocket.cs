@@ -345,7 +345,7 @@ namespace HttpSocket
             else
             {
                 Span<byte> chunkSizeTextSpan = stackalloc byte[128];
-                chunkSizeTextSpan.CopyTo(chunkSizeTextSpan);
+                chunkSizeText.CopyTo(chunkSizeTextSpan);
 
                 if (!Utf8Parser.TryParse(chunkSizeTextSpan, out chunkSize, out _, 'x'))
                 {
