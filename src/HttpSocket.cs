@@ -52,7 +52,7 @@ namespace HttpSocket
 
                         await ReadPipeAsync(pipe.Reader, httpResponse);
 
-                        Console.WriteLine($"Result: {httpResponse.State}, Status: {httpResponse.StatusCode}, Content-Length: {httpResponse.ContentLength}, Reads: {httpResponse.Reads}");
+                        Console.WriteLine($"Result: {httpResponse.State}, Status: {httpResponse.StatusCode}, Content-Length: {httpResponse.ContentLength}");
 
                         // Stop sending request if the communication faced a problem (socket error)
                         if (httpResponse.State != HttpResponseState.Completed)
@@ -108,8 +108,6 @@ namespace HttpSocket
             {
                 ReadResult result = await reader.ReadAsync();
                 var buffer = result.Buffer;
-
-                httpResponse.Reads++;
 
                 ParseHttpResponse(ref buffer, httpResponse, out var examined);
 
@@ -396,7 +394,6 @@ namespace HttpSocket
             public long ContentLengthRemaining { get; set; }
             public bool HasContentLengthHeader { get; set; }
             public int LastChunkRemaining { get; set; }
-            public int Reads { get; set; }
         }
     }
 }
