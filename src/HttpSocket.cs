@@ -242,9 +242,8 @@ namespace HttpSocket
                                 // We need to read more data
                                 break;
                             }
-                            else if (!sequenceReader.TryReadTo(out _, NewLine))
+                            else if (!TryParseCrlf(ref sequenceReader, httpResponse))
                             {
-                                httpResponse.State = HttpResponseState.Error;
                                 break;
                             }
 
@@ -271,9 +270,8 @@ namespace HttpSocket
                             if (chunkSize == 0)
                             {
                                 // The Body should end with two NewLine
-                                if (!sequenceReader.TryReadTo(out _, NewLine))
+                                if (!TryParseCrlf(ref sequenceReader, httpResponse))
                                 {
-                                    httpResponse.State = HttpResponseState.Error;
                                     break;
                                 }
 
@@ -290,6 +288,45 @@ namespace HttpSocket
 
             // Slice whatever we've read so far
             buffer = buffer.Slice(sequenceReader.Position);
+        }
+
+        private static bool TryParseCrlf(ref SequenceReader<byte> sequenceReader, HttpResponse httpResponse)
+        {
+            var status = TryParseCrlf(ref sequenceReader, out int consumed);
+            if (status == OperationStatus.NeedMoreData)
+            {
+                sequenceReader.Rewind(consumed);
+                return false;
+            }
+            else if (status == OperationStatus.InvalidData)
+            {
+                httpResponse.State = HttpResponseState.Error;
+                return false;
+            }
+
+            return true;
+        }
+
+        private static OperationStatus TryParseCrlf(ref SequenceReader<byte> sequenceReader, out int bytesConsumed)
+        {
+            bytesConsumed = 2;
+
+            if (!sequenceReader.TryRead(out var cr))
+            {
+                bytesConsumed = 1;
+                return OperationStatus.NeedMoreData;
+            }
+
+            if (!sequenceReader.TryRead(out var lf))
+            {
+                return OperationStatus.NeedMoreData;
+            }
+
+            if (cr == (byte)'\r' && lf == (byte)'\n')
+            {
+                return OperationStatus.Done;
+            }
+            return OperationStatus.InvalidData;
         }
 
         private static void ParseHeader(in ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
