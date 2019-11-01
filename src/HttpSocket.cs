@@ -11,9 +11,9 @@ namespace HttpSocket
 {
     class Program
     {
-        private static ReadOnlySpan<byte> Http11 => Encoding.ASCII.GetBytes("HTTP/1.1");
-        private static ReadOnlySpan<byte> ContentLength => Encoding.ASCII.GetBytes("Content-Length");
+        private static ReadOnlySpan<byte> Http11 => new byte[] { (byte)'H', (byte)'T', (byte)'T', (byte)'P', (byte)'/', (byte)'1', (byte)'.', (byte)'1' };
         private static ReadOnlySpan<byte> NewLine => new byte[] { (byte)'\r', (byte)'\n' };
+        private static ReadOnlySpan<byte> ContentLength => new byte[] { (byte)'C', (byte)'o', (byte)'n', (byte)'t', (byte)'e', (byte)'n', (byte)'t', (byte)'-', (byte)'L', (byte)'e', (byte)'n', (byte)'g', (byte)'t', (byte)'h' };
 
         static async Task Main(string[] args)
         {
@@ -21,9 +21,9 @@ namespace HttpSocket
             // http://10.0.0.102:5000/plaintext
 
             // TODO: parse server url
-            string hostName = "10.197.175.74";
-            // string hostName = "127.0.0.1";
-            int hostPort = 5001;
+            // string hostName = "10.197.175.74";
+            string hostName = "127.0.0.1";
+            int hostPort = 5000;
 
             var request = $"GET / HTTP/1.1\r\n" +
                 $"Host: {hostName}:{hostPort}\r\n" +
@@ -35,37 +35,69 @@ namespace HttpSocket
             IPAddress hostAddress = IPAddress.Parse(hostName);
             IPEndPoint hostEndPoint = new IPEndPoint(hostAddress, hostPort);
 
-            using (Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+            using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            await socket.ConnectAsync(hostEndPoint);
+
+            var pipe = new Pipe();
+            Task writing = FillPipeAsync(socket, pipe.Writer);
+            var reader = pipe.Reader;
+
+            try
             {
-                await socket.ConnectAsync(hostEndPoint);
+                var httpResponse = new HttpResponse();
 
-                var pipe = new Pipe();
-                Task writing = FillPipeAsync(socket, pipe.Writer);
-
-                try
+                for (var k = 0; k < 100000; k++)
                 {
-                    for (var k = 0; k < 100000; k++)
+                    httpResponse.Reset();
+
+                    var response = await socket.SendAsync(requestBytes, SocketFlags.None);
+
+                    while (true)
                     {
-                        var httpResponse = new HttpResponse();
+                        ReadResult result = await reader.ReadAsync();
+                        var buffer = result.Buffer;
 
-                        var response = await socket.SendAsync(requestBytes, SocketFlags.None);
+                        ParseHttpResponse(ref buffer, httpResponse, out var examined);
 
-                        await ReadPipeAsync(pipe.Reader, httpResponse);
+                        reader.AdvanceTo(buffer.Start, examined);
 
-                        Console.WriteLine($"Result: {httpResponse.State}, Status: {httpResponse.StatusCode}, Content-Length: {httpResponse.ContentLength}");
-
-                        // Stop sending request if the communication faced a problem (socket error)
-                        if (httpResponse.State != HttpResponseState.Completed)
+                        // Stop when the response is complete
+                        if (httpResponse.State == HttpResponseState.Completed)
                         {
                             break;
                         }
+
+                        // Stop if there is incorrect data
+                        if (httpResponse.State == HttpResponseState.Error)
+                        {
+                            // Incomplete request, close the connection with an error
+                            break;
+                        }
+
+                        // Stop reading if there's no more data coming
+                        if (result.IsCompleted)
+                        {
+                            if (httpResponse.State != HttpResponseState.Completed)
+                            {
+                                // Incomplete request, close the connection with an error
+                                break;
+                            }
+                        }
+                    }
+
+                    // Console.WriteLine($"Result: {httpResponse.State}, Status: {httpResponse.StatusCode}, Content-Length: {httpResponse.ContentLength}");
+
+                    // Stop sending request if the communication faced a problem (socket error)
+                    if (httpResponse.State != HttpResponseState.Completed)
+                    {
+                        break;
                     }
                 }
-                finally
-                {
-                    socket.Shutdown(SocketShutdown.Both);
-                    socket.Close();
-                }
+            }
+            finally
+            {
+                socket.Shutdown(SocketShutdown.Both);
+                socket.Close();
             }
         }
 
@@ -100,42 +132,6 @@ namespace HttpSocket
 
             // Tell the PipeReader that there's no more data coming
             writer.Complete();
-        }
-
-        static async Task ReadPipeAsync(PipeReader reader, HttpResponse httpResponse)
-        {
-            while (true)
-            {
-                ReadResult result = await reader.ReadAsync();
-                var buffer = result.Buffer;
-
-                ParseHttpResponse(ref buffer, httpResponse, out var examined);
-
-                reader.AdvanceTo(buffer.Start, examined);
-
-                // Stop when the response is complete
-                if (httpResponse.State == HttpResponseState.Completed)
-                {
-                    break;
-                }
-
-                // Stop if there is incorrect data
-                if (httpResponse.State == HttpResponseState.Error)
-                {
-                    // Incomplete request, close the connection with an error
-                    break;
-                }
-
-                // Stop reading if there's no more data coming
-                if (result.IsCompleted)
-                {
-                    if (httpResponse.State != HttpResponseState.Completed)
-                    {
-                        // Incomplete request, close the connection with an error
-                        break;
-                    }
-                }
-            }
         }
 
         static void ParseHttpResponse(ref ReadOnlySequence<byte> buffer, HttpResponse httpResponse, out SequencePosition examined)
@@ -298,37 +294,65 @@ namespace HttpSocket
 
         private static void ParseHeader(in ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
         {
-            var headerReader = new SequenceReader<byte>(headerLine);
+            var headerSpan = headerLine.FirstSpan;
+            var colon = headerSpan.IndexOf((byte)':');
 
-            if (!headerReader.TryReadTo(out ReadOnlySpan<byte> header, (byte)':'))
+            if (colon == -1)
+            {
+                ParseHeaderMultiSequence(headerLine, httpResponse);
+                return;
+            }
+
+            if (!headerSpan.Slice(0, colon).SequenceEqual(ContentLength))
+            {
+                return;
+            }
+
+            httpResponse.HasContentLengthHeader = true;
+            var value = headerSpan.Slice(colon + 1).Trim((byte)' ');
+
+            if (value.Length > 20)
             {
                 httpResponse.State = HttpResponseState.Error;
                 return;
             }
 
-            // If this is the Content-Length header, read its value
-            if (header.SequenceEqual(ContentLength))
+            if (!Utf8Parser.TryParse(value, out long contentLength, out _))
             {
-                httpResponse.HasContentLengthHeader = true;
-
-                var remaining = headerReader.Sequence.Slice(headerReader.Position);
-
-                if (remaining.Length > 128)
-                {
-                    // Giant number?
-                    httpResponse.State = HttpResponseState.Error;
-                    return;
-                }
-
-                if (!TryParseContentLength(remaining, out int contentLength))
-                {
-                    httpResponse.State = HttpResponseState.Error;
-                    return;
-                }
-
                 httpResponse.ContentLength = contentLength;
                 httpResponse.ContentLengthRemaining = contentLength;
             }
+        }
+
+        private static void ParseHeaderMultiSequence(ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
+        {
+            var reader = new SequenceReader<byte>(headerLine);
+
+            if (!reader.TryReadTo(out ReadOnlySpan<byte> name, (byte)':'))
+            {
+                httpResponse.State = HttpResponseState.Error;
+                return;
+            }
+
+            if (!name.SequenceEqual(ContentLength))
+            {
+                return;
+            }
+
+            httpResponse.HasContentLengthHeader = true;
+
+            // TrimStart
+            reader.AdvancePast((byte)' ');
+            var remaining = reader.Sequence.Slice(reader.Position);
+
+            if (!TryParseContentLength(remaining, out long contentLength))
+            {
+                httpResponse.State = HttpResponseState.Error;
+                return;
+            }
+
+            httpResponse.ContentLength = contentLength;
+            httpResponse.ContentLengthRemaining = contentLength;
         }
 
         private static bool TryParseChunkPrefix(in ReadOnlySequence<byte> chunkSizeText, out int chunkSize)
@@ -342,7 +366,14 @@ namespace HttpSocket
             }
             else
             {
-                Span<byte> chunkSizeTextSpan = stackalloc byte[128];
+                if (chunkSizeText.Length > 16)
+                {
+                    chunkSize = 0;
+                    return false;
+                }
+
+                // Max number of hex digits in a long
+                Span<byte> chunkSizeTextSpan = stackalloc byte[16];
                 chunkSizeText.CopyTo(chunkSizeTextSpan);
 
                 if (!Utf8Parser.TryParse(chunkSizeTextSpan, out chunkSize, out _, 'x'))
@@ -353,7 +384,7 @@ namespace HttpSocket
             return true;
         }
 
-        private static bool TryParseContentLength(in ReadOnlySequence<byte> remaining, out int contentLength)
+        private static bool TryParseContentLength(in ReadOnlySequence<byte> remaining, out long contentLength)
         {
             if (remaining.IsSingleSegment)
             {
@@ -364,7 +395,14 @@ namespace HttpSocket
             }
             else
             {
-                Span<byte> contentLengthText = stackalloc byte[128];
+                if (remaining.Length > 20)
+                {
+                    contentLength = 0;
+                    return false;
+                }
+
+                // Max number of dec digits in a long
+                Span<byte> contentLengthText = stackalloc byte[20];
                 remaining.CopyTo(contentLengthText);
 
                 if (!Utf8Parser.TryParse(contentLengthText.TrimStart((byte)' '), out contentLength, out _))
@@ -390,10 +428,20 @@ namespace HttpSocket
         {
             public HttpResponseState State { get; set; } = HttpResponseState.StartLine;
             public int StatusCode { get; set; }
-            public int ContentLength { get; set; }
+            public long ContentLength { get; set; }
             public long ContentLengthRemaining { get; set; }
             public bool HasContentLengthHeader { get; set; }
             public int LastChunkRemaining { get; set; }
+
+            public void Reset()
+            {
+                State = HttpResponseState.StartLine;
+                StatusCode = default;
+                ContentLength = default;
+                ContentLengthRemaining = default;
+                HasContentLengthHeader = default;
+                LastChunkRemaining = default;
+            }
         }
     }
 }
