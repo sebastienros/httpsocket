@@ -341,18 +341,17 @@ namespace HttpSocket
             }
 
             httpResponse.HasContentLengthHeader = true;
+
             var value = headerSpan.Slice(colon + 1).Trim((byte)' ');
 
-            if (value.Length > 20)
-            {
-                httpResponse.State = HttpResponseState.Error;
-                return;
-            }
-
-            if (!Utf8Parser.TryParse(value, out long contentLength, out _))
+            if (Utf8Parser.TryParse(value, out long contentLength, out _))
             {
                 httpResponse.ContentLength = contentLength;
                 httpResponse.ContentLengthRemaining = contentLength;
+            }
+            else
+            {
+                httpResponse.State = HttpResponseState.Error;
             }
         }
 
