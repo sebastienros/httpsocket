@@ -4,6 +4,7 @@ using System.Buffers.Text;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -142,11 +143,20 @@ namespace HttpSocket
             switch (httpResponse.State)
             {
                 case HttpResponseState.StartLine:
-
-                    if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> version, (byte)' '))
+                    if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> startLine, NewLine))
                     {
                         return;
                     }
+
+                    var space = startLine.IndexOf((byte)' ');
+
+                    if (space == -1)
+                    {
+                        httpResponse.State = HttpResponseState.Error;
+                        return;
+                    }
+
+                    var version = startLine.Slice(0, space);
 
                     if (!version.SequenceEqual(Http11))
                     {
@@ -154,34 +164,33 @@ namespace HttpSocket
                         return;
                     }
 
-                    if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> statusCodeText, (byte)' '))
-                    {
-                        return;
-                    }
-                    else if (!Utf8Parser.TryParse(statusCodeText, out int statusCode, out _))
+                    startLine = startLine.Slice(space + 1);
+
+                    space = startLine.IndexOf((byte)' ');
+
+                    if (space == -1 || !Utf8Parser.TryParse(startLine.Slice(0, space), out int statusCode, out _))
                     {
                         httpResponse.State = HttpResponseState.Error;
+                        return;
                     }
                     else
                     {
                         httpResponse.StatusCode = statusCode;
                     }
 
-                    if (!sequenceReader.TryReadTo(out ReadOnlySequence<byte> statusText, NewLine))
-                    {
-                        return;
-                    }
+                    // reason phrase
+                    // startLine.Slice(space + 1)
 
                     httpResponse.State = HttpResponseState.Headers;
 
                     examined = sequenceReader.Position;
 
-                    break;
+                    goto case HttpResponseState.Headers;
 
                 case HttpResponseState.Headers:
 
                     // Read evey headers
-                    while (sequenceReader.TryReadTo(out var headerLine, NewLine))
+                    while (sequenceReader.TryReadTo(out ReadOnlySpan<byte> headerLine, NewLine))
                     {
                         // Is that the end of the headers?
                         if (headerLine.Length == 0)
@@ -189,11 +198,17 @@ namespace HttpSocket
                             examined = sequenceReader.Position;
 
                             // End of headers
-                            httpResponse.State = httpResponse.HasContentLengthHeader
-                                ? httpResponse.State = HttpResponseState.Body
-                                : httpResponse.State = HttpResponseState.ChunkedBody;
 
-                            break;
+                            if (httpResponse.HasContentLengthHeader)
+                            {
+                                httpResponse.State = HttpResponseState.Body;
+
+                                goto case HttpResponseState.Body;
+                            }
+
+                            httpResponse.State = HttpResponseState.ChunkedBody;
+
+                            goto case HttpResponseState.ChunkedBody;
                         }
 
                         // Parse the header
@@ -251,7 +266,7 @@ namespace HttpSocket
                         }
                         else
                         {
-                            if (!sequenceReader.TryReadTo(out ReadOnlySequence<byte> chunkSizeText, NewLine))
+                            if (!sequenceReader.TryReadTo(out ReadOnlySpan<byte> chunkSizeText, NewLine))
                             {
                                 // Don't have a full chunk yet
                                 break;
@@ -292,51 +307,31 @@ namespace HttpSocket
 
         private static bool TryParseCrlf(ref SequenceReader<byte> sequenceReader, HttpResponse httpResponse)
         {
-            var status = TryParseCrlf(ref sequenceReader, out int consumed);
-            if (status == OperationStatus.NeedMoreData)
+            // Need at least 2 characters in the buffer to make a call
+            if (sequenceReader.Remaining < 2)
             {
-                sequenceReader.Rewind(consumed);
-                return false;
-            }
-            else if (status == OperationStatus.InvalidData)
-            {
-                httpResponse.State = HttpResponseState.Error;
                 return false;
             }
 
-            return true;
+            // We expect a crlf
+            if (sequenceReader.IsNext(NewLine, advancePast: true))
+            {
+                return true;
+            }
+
+            // Didn't see that, broken server
+            httpResponse.State = HttpResponseState.Error;
+            return false;
         }
 
-        private static OperationStatus TryParseCrlf(ref SequenceReader<byte> sequenceReader, out int bytesConsumed)
+        private static void ParseHeader(in ReadOnlySpan<byte> headerLine, HttpResponse httpResponse)
         {
-            bytesConsumed = 2;
-
-            if (!sequenceReader.TryRead(out var cr))
-            {
-                bytesConsumed = 1;
-                return OperationStatus.NeedMoreData;
-            }
-
-            if (!sequenceReader.TryRead(out var lf))
-            {
-                return OperationStatus.NeedMoreData;
-            }
-
-            if (cr == (byte)'\r' && lf == (byte)'\n')
-            {
-                return OperationStatus.Done;
-            }
-            return OperationStatus.InvalidData;
-        }
-
-        private static void ParseHeader(in ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
-        {
-            var headerSpan = headerLine.FirstSpan;
+            var headerSpan = headerLine;
             var colon = headerSpan.IndexOf((byte)':');
 
             if (colon == -1)
             {
-                ParseHeaderMultiSequence(headerLine, httpResponse);
+                httpResponse.State = HttpResponseState.Error;
                 return;
             }
 
@@ -361,94 +356,10 @@ namespace HttpSocket
             }
         }
 
-        private static void ParseHeaderMultiSequence(ReadOnlySequence<byte> headerLine, HttpResponse httpResponse)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryParseChunkPrefix(in ReadOnlySpan<byte> chunkSizeText, out int chunkSize)
         {
-            var reader = new SequenceReader<byte>(headerLine);
-
-            if (!reader.TryReadTo(out ReadOnlySpan<byte> name, (byte)':'))
-            {
-                httpResponse.State = HttpResponseState.Error;
-                return;
-            }
-
-            if (!name.SequenceEqual(ContentLength))
-            {
-                return;
-            }
-
-            httpResponse.HasContentLengthHeader = true;
-
-            // TrimStart
-            reader.AdvancePast((byte)' ');
-            var remaining = reader.Sequence.Slice(reader.Position);
-
-            if (!TryParseContentLength(remaining, out long contentLength))
-            {
-                httpResponse.State = HttpResponseState.Error;
-                return;
-            }
-
-            httpResponse.ContentLength = contentLength;
-            httpResponse.ContentLengthRemaining = contentLength;
-        }
-
-        private static bool TryParseChunkPrefix(in ReadOnlySequence<byte> chunkSizeText, out int chunkSize)
-        {
-            if (chunkSizeText.IsSingleSegment)
-            {
-                if (!Utf8Parser.TryParse(chunkSizeText.FirstSpan, out chunkSize, out _, 'x'))
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                if (chunkSizeText.Length > 16)
-                {
-                    chunkSize = 0;
-                    return false;
-                }
-
-                // Max number of hex digits in a long
-                Span<byte> chunkSizeTextSpan = stackalloc byte[16];
-                chunkSizeText.CopyTo(chunkSizeTextSpan);
-
-                if (!Utf8Parser.TryParse(chunkSizeTextSpan, out chunkSize, out _, 'x'))
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private static bool TryParseContentLength(in ReadOnlySequence<byte> remaining, out long contentLength)
-        {
-            if (remaining.IsSingleSegment)
-            {
-                if (!Utf8Parser.TryParse(remaining.FirstSpan.TrimStart((byte)' '), out contentLength, out _))
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                if (remaining.Length > 20)
-                {
-                    contentLength = 0;
-                    return false;
-                }
-
-                // Max number of dec digits in a long
-                Span<byte> contentLengthText = stackalloc byte[20];
-                remaining.CopyTo(contentLengthText);
-
-                if (!Utf8Parser.TryParse(contentLengthText.TrimStart((byte)' '), out contentLength, out _))
-                {
-                    return false;
-                }
-            }
-
-            return true;
+            return Utf8Parser.TryParse(chunkSizeText, out chunkSize, out _, 'x');
         }
 
         private enum HttpResponseState
